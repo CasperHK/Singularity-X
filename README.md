@@ -14,7 +14,7 @@ Singularity-X 不是為了追隨 DeepSeek, Claude 或 ChatGPT 而存在，它是
 我們跳過人工標註的低效階段，利用大規模強化學習讓模型在運算過程中自發產生「邏輯湧現」，目標是解決人類尚未解開的數學與物理難題。
 
 ## 3. 技術規格 (Technical Specs)
-* **語言驅動:** Mojo 🔥 (The Future of AI)
+* **語言驅動:** [Mojo 🔥 (The Future of AI)](https://www.modular.com/open-source/mojo)
 * **芯片優化:** 針對 NVIDIA Hopper/Blackwell 與國產 NPU 進行 MLIR 級別的深度適配。
 * **通訊協議:** 自研高性能集體通信庫（High-Performance Collective Communication），消滅多機多卡訓練的延遲瓶頸。
 
