@@ -1,4 +1,4 @@
-# 🌌 Project Singularity
+# 🌌 Project Singularity-X
 **The point where Machine Intelligence becomes unstoppable.**
 
 ## 1. 宣言 (The Manifesto)
