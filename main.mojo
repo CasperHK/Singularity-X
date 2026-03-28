@@ -2,19 +2,21 @@
 # Project Singularity — entry point.
 #
 # Defines:
-#   • ExpertLayer   — a single FFN expert used inside the MoE block.
-#   • MoEBlock      — Mixture-of-Experts layer with top-k gating.
-#   • AttentionHead — single attention head backed by the SDPA kernel.
-#   • TransformerLayer — combines attention + MoE for one transformer layer.
-#   • SingularityModel  — full model with multi-device sharding metadata.
-#   • main()         — minimal inference smoke-test.
+#   • ExpertLayer      — single FFN expert with W1/GeLU/W2 transform.
+#   • MoEBlock         — Mixture-of-Experts with learnable top-k gating.
+#   • AttentionHead    — single attention head with Q/K/V/O projections.
+#   • TransformerLayer — pre-norm attention + MoE for one transformer layer.
+#   • SingularityModel — full model with multi-device sharding metadata.
+#   • main()           — minimal inference smoke-test.
 
 from memory import UnsafePointer, memset_zero
 from sys.info import simdwidthof, num_logical_cores
 from algorithm import parallelize
-from math import sqrt
+from math import sqrt, exp
 
 from attention import scaled_dot_product_attention, DEFAULT_DTYPE
+from gemm import gemm
+from norm import rms_norm
 
 # ---------------------------------------------------------------------------
 # Compile-time model hyper-parameters
@@ -30,6 +32,21 @@ alias NUM_EXPERTS  = 8       # total experts in each MoE block
 alias TOP_K        = 2       # how many experts are activated per token
 alias HIDDEN_DIM   = HEAD_DIM * NUM_HEADS   # 512
 alias FFN_DIM      = HIDDEN_DIM * 4         # 2048
+
+# ---------------------------------------------------------------------------
+# Activation helper
+# ---------------------------------------------------------------------------
+
+@always_inline
+fn _gelu[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
+    """Fast GeLU approximation: x · sigmoid(1.702 · x).
+
+    This is the Hendrycks & Gimpel (2016) GeLU approximated via sigmoid,
+    which requires only a single exp() call and is accurate to < 0.1 %.
+    """
+    var e = exp(-Scalar[dtype](1.702) * x)
+    return x * (Scalar[dtype](1) / (Scalar[dtype](1) + e))
+
 
 # ---------------------------------------------------------------------------
 # Device descriptor — lightweight struct tracking which physical device
@@ -108,11 +125,41 @@ struct ExpertLayer:
         x_ptr:   UnsafePointer[Scalar[DTYPE]],   # [SEQ_LEN × HIDDEN_DIM]
         out_ptr: UnsafePointer[Scalar[DTYPE]],   # [SEQ_LEN × HIDDEN_DIM]
     ):
-        """Minimal forward pass placeholder (weight matmul omitted for brevity)."""
-        # In production this would call a tiled GEMM; here we copy input → output
-        # to keep the boilerplate compilable and self-contained.
-        for i in range(SEQ_LEN * HIDDEN_DIM):
-            out_ptr[i] = x_ptr[i]
+        """Two-layer FFN forward pass: out = W2 · GeLU(W1 · x).
+
+        Computes the full sequence in one batched GEMM pair:
+          tmp     = x @ w1          [SEQ_LEN × FFN_DIM]
+          GeLU applied element-wise
+          out_ptr = tmp @ w2         [SEQ_LEN × HIDDEN_DIM]
+        """
+        var tmp = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * FFN_DIM)
+        # tmp = x @ w1  (SEQ_LEN × HIDDEN_DIM) @ (HIDDEN_DIM × FFN_DIM)
+        gemm[DTYPE](x_ptr, self.w1, tmp, SEQ_LEN, HIDDEN_DIM, FFN_DIM)
+        # GeLU activation in-place.
+        for i in range(SEQ_LEN * FFN_DIM):
+            tmp[i] = _gelu(tmp[i])
+        # out = tmp @ w2  (SEQ_LEN × FFN_DIM) @ (FFN_DIM × HIDDEN_DIM)
+        gemm[DTYPE](tmp, self.w2, out_ptr, SEQ_LEN, FFN_DIM, HIDDEN_DIM)
+        tmp.free()
+
+    fn forward_single(
+        self,
+        x_row:   UnsafePointer[Scalar[DTYPE]],   # [HIDDEN_DIM] — one token
+        out_row: UnsafePointer[Scalar[DTYPE]],   # [HIDDEN_DIM] — one token output
+    ):
+        """Single-token FFN forward: out = W2 · GeLU(W1 · x).
+
+        Used by MoEBlock to dispatch individual tokens to their chosen experts
+        without processing the entire sequence through each expert.
+        """
+        var tmp = UnsafePointer[Scalar[DTYPE]].alloc(FFN_DIM)
+        # tmp = x_row @ w1  (1 × HIDDEN_DIM) @ (HIDDEN_DIM × FFN_DIM)
+        gemm[DTYPE](x_row, self.w1, tmp, 1, HIDDEN_DIM, FFN_DIM)
+        for i in range(FFN_DIM):
+            tmp[i] = _gelu(tmp[i])
+        # out_row = tmp @ w2  (1 × FFN_DIM) @ (FFN_DIM × HIDDEN_DIM)
+        gemm[DTYPE](tmp, self.w2, out_row, 1, FFN_DIM, HIDDEN_DIM)
+        tmp.free()
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +192,88 @@ struct MoEBlock:
         x_ptr:   UnsafePointer[Scalar[DTYPE]],
         out_ptr: UnsafePointer[Scalar[DTYPE]],
     ):
-        """Route tokens through top-k experts (simplified gating placeholder)."""
-        # Full implementation: compute gate logits, softmax, top-k select,
-        # dispatch to experts, weighted sum.  Placeholder copies x → out.
-        for i in range(SEQ_LEN * HIDDEN_DIM):
-            out_ptr[i] = x_ptr[i]
+        """Route each token to the top-k experts and aggregate their outputs.
+
+        Algorithm:
+          1. Compute gate logits: (SEQ_LEN × HIDDEN_DIM) @ (HIDDEN_DIM × NUM_EXPERTS)
+          2. Softmax over expert dimension per token.
+          3. For each token select the top-2 experts by gate probability.
+          4. Renormalise selected weights to sum to 1.
+          5. Run each selected expert on the single token row (forward_single).
+          6. Accumulate weighted expert outputs into out_ptr.
+        """
+        # --- gate logits --------------------------------------------------- #
+        var gate_logits = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * NUM_EXPERTS)
+        gemm[DTYPE](x_ptr, self.gate_w, gate_logits, SEQ_LEN, HIDDEN_DIM, NUM_EXPERTS)
+
+        # Softmax over experts for each token (numerically stable).
+        for s in range(SEQ_LEN):
+            var row = gate_logits + s * NUM_EXPERTS
+            var max_val = row[0]
+            for e in range(1, NUM_EXPERTS):
+                if row[e] > max_val:
+                    max_val = row[e]
+            var total = Scalar[DTYPE](0)
+            for e in range(NUM_EXPERTS):
+                var v = exp(row[e] - max_val)
+                row[e] = v
+                total += v
+            var inv_total = Scalar[DTYPE](1) / total
+            for e in range(NUM_EXPERTS):
+                row[e] *= inv_total
+
+        # --- top-k dispatch ------------------------------------------------ #
+        memset_zero(out_ptr, SEQ_LEN * HIDDEN_DIM)
+        var expert_out = UnsafePointer[Scalar[DTYPE]].alloc(HIDDEN_DIM)
+
+        for s in range(SEQ_LEN):
+            var logit_row = gate_logits + s * NUM_EXPERTS
+
+            # Find top-1 expert.
+            var top1_idx = 0
+            var top1_val = logit_row[0]
+            for e in range(1, NUM_EXPERTS):
+                if logit_row[e] > top1_val:
+                    top1_val = logit_row[e]
+                    top1_idx = e
+
+            # Find top-2 expert (different from top-1).
+            # NUM_EXPERTS >= 2 is guaranteed by the model hyper-parameters.
+            var top2_idx = 0 if top1_idx != 0 else 1
+            var top2_val = logit_row[top2_idx]
+            for e in range(NUM_EXPERTS):
+                if e != top1_idx and logit_row[e] > top2_val:
+                    top2_val = logit_row[e]
+                    top2_idx = e
+
+            # Renormalise top-2 weights so they sum to 1.
+            var norm = top1_val + top2_val
+            var w1: Scalar[DTYPE]
+            var w2: Scalar[DTYPE]
+            if norm > Scalar[DTYPE](0):
+                w1 = top1_val / norm
+                w2 = top2_val / norm
+            else:
+                w1 = Scalar[DTYPE](0.5)
+                w2 = Scalar[DTYPE](0.5)
+
+            var x_row   = x_ptr   + s * HIDDEN_DIM
+            var out_row = out_ptr + s * HIDDEN_DIM
+
+            # Expert 1.
+            memset_zero(expert_out, HIDDEN_DIM)
+            (self.experts + top1_idx)[].forward_single(x_row, expert_out)
+            for d in range(HIDDEN_DIM):
+                out_row[d] += w1 * expert_out[d]
+
+            # Expert 2.
+            memset_zero(expert_out, HIDDEN_DIM)
+            (self.experts + top2_idx)[].forward_single(x_row, expert_out)
+            for d in range(HIDDEN_DIM):
+                out_row[d] += w2 * expert_out[d]
+
+        expert_out.free()
+        gate_logits.free()
 
 
 # ---------------------------------------------------------------------------
@@ -186,17 +310,23 @@ struct AttentionHead:
         x_ptr:   UnsafePointer[Scalar[DTYPE]],   # [SEQ_LEN × HIDDEN_DIM]
         out_ptr: UnsafePointer[Scalar[DTYPE]],   # [SEQ_LEN × HEAD_DIM]
     ):
-        """Project input to Q/K/V, run SDPA, write result to out_ptr."""
+        """Project input to Q/K/V, run SDPA, write result to out_ptr.
+
+        Q = x @ wq   [SEQ_LEN × HEAD_DIM]
+        K = x @ wk   [SEQ_LEN × HEAD_DIM]
+        V = x @ wv   [SEQ_LEN × HEAD_DIM]
+        out = SDPA(Q, K, V)
+        """
         # Allocate projected Q, K, V buffers.
         var q = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HEAD_DIM)
         var k = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HEAD_DIM)
         var v = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HEAD_DIM)
-        memset_zero(q, SEQ_LEN * HEAD_DIM)
-        memset_zero(k, SEQ_LEN * HEAD_DIM)
-        memset_zero(v, SEQ_LEN * HEAD_DIM)
 
-        # TODO: GEMM projections (wq/wk/wv × x) go here.
-        # For now, pass zero-initialised buffers to demonstrate the kernel call.
+        # Q/K/V projections via GEMM.
+        # x: (SEQ_LEN × HIDDEN_DIM) @ wq: (HIDDEN_DIM × HEAD_DIM) → (SEQ_LEN × HEAD_DIM)
+        gemm[DTYPE](x_ptr, self.wq, q, SEQ_LEN, HIDDEN_DIM, HEAD_DIM)
+        gemm[DTYPE](x_ptr, self.wk, k, SEQ_LEN, HIDDEN_DIM, HEAD_DIM)
+        gemm[DTYPE](x_ptr, self.wv, v, SEQ_LEN, HIDDEN_DIM, HEAD_DIM)
 
         scaled_dot_product_attention[DTYPE](
             q, k, v, out_ptr, SEQ_LEN, HEAD_DIM
@@ -212,10 +342,19 @@ struct AttentionHead:
 # ---------------------------------------------------------------------------
 
 struct TransformerLayer:
-    """One Transformer layer: multi-head attention followed by a MoE block."""
-    var heads:     UnsafePointer[AttentionHead]
-    var moe_block: MoEBlock
-    var layer_id:  Int
+    """One Transformer layer: pre-norm attention followed by a pre-norm MoE block.
+
+    Architecture (pre-LayerNorm style, as used in LLaMA / Mistral):
+        mha_in  = RMSNorm(x, gamma_attn)
+        mha_out = MultiHeadAttention(mha_in)   + x          # residual
+        moe_in  = RMSNorm(mha_out, gamma_moe)
+        out     = MoEBlock(moe_in)             + mha_out    # residual
+    """
+    var heads:      UnsafePointer[AttentionHead]
+    var moe_block:  MoEBlock
+    var gamma_attn: UnsafePointer[Scalar[DTYPE]]   # [HIDDEN_DIM] RMSNorm scale
+    var gamma_moe:  UnsafePointer[Scalar[DTYPE]]   # [HIDDEN_DIM] RMSNorm scale
+    var layer_id:   Int
 
     fn __init__(out self, layer_id: Int):
         self.layer_id  = layer_id
@@ -224,27 +363,47 @@ struct TransformerLayer:
         self.heads = UnsafePointer[AttentionHead].alloc(NUM_HEADS)
         for h in range(NUM_HEADS):
             (self.heads + h).init_pointee_move(AttentionHead(h))
+        # RMSNorm scale parameters — initialised to 1 (identity transform).
+        self.gamma_attn = UnsafePointer[Scalar[DTYPE]].alloc(HIDDEN_DIM)
+        self.gamma_moe  = UnsafePointer[Scalar[DTYPE]].alloc(HIDDEN_DIM)
+        for i in range(HIDDEN_DIM):
+            self.gamma_attn[i] = Scalar[DTYPE](1.0)
+            self.gamma_moe[i]  = Scalar[DTYPE](1.0)
 
     fn __del__(owned self):
         for h in range(NUM_HEADS):
             (self.heads + h).destroy_pointee()
         self.heads.free()
+        self.gamma_attn.free()
+        self.gamma_moe.free()
 
     fn forward(
         self,
         x_ptr:   UnsafePointer[Scalar[DTYPE]],
         out_ptr: UnsafePointer[Scalar[DTYPE]],
     ):
-        """Run multi-head attention then MoE on the input sequence."""
-        # Collect per-head outputs into a temporary buffer.
-        var mha_out = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HIDDEN_DIM)
-        memset_zero(mha_out, SEQ_LEN * HIDDEN_DIM)
+        """Run pre-norm multi-head attention then pre-norm MoE on the input."""
+        alias eps = Scalar[DTYPE](1e-6)
 
+        # ------------------------------------------------------------------ #
+        # 1. Pre-attention RMSNorm (operate on a copy to preserve x for residual)
+        # ------------------------------------------------------------------ #
+        var norm_x = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HIDDEN_DIM)
+        for i in range(SEQ_LEN * HIDDEN_DIM):
+            norm_x[i] = x_ptr[i]
+        for s in range(SEQ_LEN):
+            rms_norm[DTYPE](norm_x + s * HIDDEN_DIM, self.gamma_attn, HIDDEN_DIM, eps)
+
+        # ------------------------------------------------------------------ #
+        # 2. Multi-head attention on norm_x
+        # ------------------------------------------------------------------ #
+        var mha_out  = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HIDDEN_DIM)
+        memset_zero(mha_out, SEQ_LEN * HIDDEN_DIM)
         var head_out = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HEAD_DIM)
 
         for h in range(NUM_HEADS):
             memset_zero(head_out, SEQ_LEN * HEAD_DIM)
-            (self.heads + h)[].forward(x_ptr, head_out)
+            (self.heads + h)[].forward(norm_x, head_out)
             # Scatter head output into the correct slice of mha_out.
             var offset = h * HEAD_DIM
             for s in range(SEQ_LEN):
@@ -254,15 +413,28 @@ struct TransformerLayer:
                     )
 
         head_out.free()
+        norm_x.free()
 
         # Residual connection: mha_out += x
         for i in range(SEQ_LEN * HIDDEN_DIM):
             mha_out[i] += x_ptr[i]
 
-        # MoE forward pass (in-place result written to out_ptr).
-        self.moe_block.forward(mha_out, out_ptr)
+        # ------------------------------------------------------------------ #
+        # 3. Pre-MoE RMSNorm (operate on a copy to preserve mha_out for residual)
+        # ------------------------------------------------------------------ #
+        var norm_mha = UnsafePointer[Scalar[DTYPE]].alloc(SEQ_LEN * HIDDEN_DIM)
+        for i in range(SEQ_LEN * HIDDEN_DIM):
+            norm_mha[i] = mha_out[i]
+        for s in range(SEQ_LEN):
+            rms_norm[DTYPE](norm_mha + s * HIDDEN_DIM, self.gamma_moe, HIDDEN_DIM, eps)
 
-        # Second residual: out += mha_out (pre-MoE)
+        # ------------------------------------------------------------------ #
+        # 4. MoE block on norm_mha → out_ptr, then residual
+        # ------------------------------------------------------------------ #
+        self.moe_block.forward(norm_mha, out_ptr)
+        norm_mha.free()
+
+        # Second residual: out += mha_out
         for i in range(SEQ_LEN * HIDDEN_DIM):
             out_ptr[i] += mha_out[i]
 
